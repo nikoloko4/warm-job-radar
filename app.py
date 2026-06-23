@@ -21,8 +21,6 @@ import search as search_mod
 
 load_dotenv()
 
-DAILY_CSE_LIMIT = 100
-
 # ---------------------------------------------------------------------------
 # Shared state (single-user local app — threading is safe)
 # ---------------------------------------------------------------------------
@@ -35,8 +33,6 @@ _state: dict = {
     "done": 0,
     "errors": 0,
     "results": [],
-    "cse_calls_today": 0,
-    "cse_date": "",
     "history": [],  # last 10 completed search sessions
 }
 
@@ -152,7 +148,6 @@ app.layout = dbc.Container(fluid=True, children=[
                 dbc.Progress(id="progress-bar", value=0, max=100, striped=True, animated=True,
                              className="mb-1", style={"height": "20px"}),
                 html.Div(id="progress-label", className="small text-muted"),
-                html.Div(id="cse-quota-warning", className="small text-warning"),
             ]),
 
             # Results table
@@ -321,7 +316,6 @@ def start_search_callback(n_clicks, company_map_json, job_title, location):
     Output("results-table", "data"),
     Output("progress-bar", "value", allow_duplicate=True),
     Output("progress-label", "children", allow_duplicate=True),
-    Output("cse-quota-warning", "children"),
     Output("history-sidebar", "children"),
     Output("poll-interval", "disabled", allow_duplicate=True),
     Input("poll-interval", "n_intervals"),
@@ -333,16 +327,10 @@ def update_ui_callback(n_intervals):
         total = _state["total"]
         running = _state["running"]
         results = list(_state["results"])
-        cse_calls = _state.get("cse_calls_today", 0)
         history = list(_state["history"])
 
     pct = int(done / total * 100) if total > 0 else 0
     label = f"{done} / {total} companies checked" if total > 0 else ""
-
-    if cse_calls >= DAILY_CSE_LIMIT * 0.9:
-        cse_warning = f"Warning: {cse_calls}/{DAILY_CSE_LIMIT} Google CSE queries used today."
-    else:
-        cse_warning = ""
 
     # Format job_url as markdown link if it's a real URL
     table_rows = []
@@ -359,7 +347,6 @@ def update_ui_callback(n_intervals):
         table_rows,
         pct,
         label,
-        cse_warning,
         _history_items(history),
         interval_disabled,
     )
