@@ -1,0 +1,15 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.playwright/
+ms-playwright/
+search_history.json
+*.csv
+.cache/
+cache.json
+*.egg-info/
+dist/
+build/
+.DS_Store
