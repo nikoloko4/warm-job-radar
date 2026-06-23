@@ -4,10 +4,10 @@ Core search logic: direct URL probing, Playwright page loading, Claude API calls
 
 import hashlib
 import json
-import os
 import re
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 import anthropic
@@ -20,7 +20,7 @@ load_dotenv()
 # Constants
 # ---------------------------------------------------------------------------
 
-CLAUDE_MODEL_EXTRACT = "claude-haiku-4-5-20251001"   # cheap model for role extraction
+CLAUDE_MODEL_EXTRACT  = "claude-haiku-4-5-20251001"  # cheap model for role extraction
 CLAUDE_MODEL_REFERRAL = "claude-sonnet-4-6"           # quality model for referral messages
 
 # Common corporate suffixes to strip when deriving a domain slug from a company name
@@ -37,7 +37,6 @@ CAREERS_NAV_KEYWORDS = [
     "engineering", "product", "design", "careers", "positions",
 ]
 
-# Minimum useful page text length to bother calling Claude
 MIN_USEFUL_CONTENT_CHARS = 500
 
 # Keywords that indicate a paragraph is job-related (used for pre-filtering)
@@ -47,34 +46,26 @@ JOB_TEXT_KEYWORDS = {
     "hybrid", "location", "opening", "vacancy", "hire", "hiring",
 }
 
-# Max estimated tokens of filtered company text per Claude batch call
-BATCH_TOKEN_BUDGET = 3500
-
-CACHE_FILE = Path("cache.json")
+CACHE_FILE        = Path("cache.json")
 CACHE_TTL_SECONDS = 86400  # 24 hours
 
 # ---------------------------------------------------------------------------
-# Thread-local Playwright browser (one browser per worker thread)
+# Single shared Playwright browser (one instance for the whole process)
 # ---------------------------------------------------------------------------
 
-_thread_local = threading.local()
+_browser_lock        = threading.Lock()
+_browser             = None
+_playwright_instance = None
 
 
 def _get_browser():
-    if not hasattr(_thread_local, "browser"):
-        _thread_local._pw = sync_playwright().start()
-        _thread_local.browser = _thread_local._pw.chromium.launch(headless=True)
-    return _thread_local.browser
-
-
-def _close_thread_browser():
-    """Call at thread exit to cleanly shut down the browser."""
-    if hasattr(_thread_local, "browser"):
-        try:
-            _thread_local.browser.close()
-            _thread_local._pw.stop()
-        except Exception:
-            pass
+    global _browser, _playwright_instance
+    if _browser is None:
+        with _browser_lock:
+            if _browser is None:  # double-checked locking
+                _playwright_instance = sync_playwright().start()
+                _browser = _playwright_instance.chromium.launch(headless=True)
+    return _browser
 
 
 # ---------------------------------------------------------------------------
@@ -99,19 +90,18 @@ def _save_cache(data: dict):
 
 def _cache_get(key: str):
     with _cache_lock:
-        data = _load_cache()
+        data  = _load_cache()
         entry = data.get(key)
         if not entry:
             return None
-        age = time.time() - entry.get("ts", 0)
-        if age > CACHE_TTL_SECONDS:
+        if time.time() - entry.get("ts", 0) > CACHE_TTL_SECONDS:
             return None
         return entry.get("value")
 
 
 def _cache_set(key: str, value):
     with _cache_lock:
-        data = _load_cache()
+        data      = _load_cache()
         data[key] = {"value": value, "ts": time.time()}
         _save_cache(data)
 
@@ -120,21 +110,25 @@ def _page_cache_key(company: str) -> str:
     return f"page:{hashlib.sha256(company.lower().encode()).hexdigest()}"
 
 
-def _claude_cache_key(company: str, job_title: str, text: str) -> str:
-    raw = f"{company.lower()}|{job_title.lower()}|{text}"
+def _claude_cache_key(company: str, job_titles: list[str], text: str) -> str:
+    raw = f"{company.lower()}|{'|'.join(sorted(job_titles))}|{text}"
     return f"claude:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
+def _synonyms_cache_key(job_title: str) -> str:
+    return f"synonyms:{hashlib.sha256(job_title.lower().encode()).hexdigest()}"
+
+
 # ---------------------------------------------------------------------------
-# URL pattern generation (no external API needed)
+# URL pattern generation
 # ---------------------------------------------------------------------------
 
 def _make_slugs(company: str) -> list[str]:
     """Derive likely domain slugs from a company name."""
-    cleaned = _CORP_SUFFIXES.sub("", company)
-    cleaned = re.sub(r"[^a-zA-Z0-9\s-]", "", cleaned).strip().lower()
-    slug_plain = re.sub(r"[\s-]+", "", cleaned)       # "acme corp" → "acmecorp"
-    slug_hyphen = re.sub(r"\s+", "-", cleaned).strip("-")  # "acme corp" → "acme-corp"
+    cleaned     = _CORP_SUFFIXES.sub("", company)
+    cleaned     = re.sub(r"[^a-zA-Z0-9\s-]", "", cleaned).strip().lower()
+    slug_plain  = re.sub(r"[\s-]+", "", cleaned)
+    slug_hyphen = re.sub(r"\s+", "-", cleaned).strip("-")
     seen = []
     for s in [slug_plain, slug_hyphen]:
         if s and s not in seen:
@@ -143,7 +137,6 @@ def _make_slugs(company: str) -> list[str]:
 
 
 def _tier1_url_patterns(company: str) -> list[str]:
-    """Return direct careers-page URL candidates for the company's own site."""
     urls = []
     for slug in _make_slugs(company):
         urls += [
@@ -158,7 +151,6 @@ def _tier1_url_patterns(company: str) -> list[str]:
 
 
 def _tier2_url_patterns(company: str) -> list[str]:
-    """Return Greenhouse / Lever / Ashby URL candidates for the company."""
     urls = []
     for slug in _make_slugs(company):
         urls += [
@@ -171,38 +163,59 @@ def _tier2_url_patterns(company: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Playwright page loading
+# Fast HTTP pre-check (stdlib only, no extra dependency)
 # ---------------------------------------------------------------------------
 
-def _visit_page_playwright(url: str, timeout: int = 20000) -> str:
-    """Load a URL with a real browser, click relevant nav links, return body text."""
+def _url_likely_exists(url: str) -> bool:
+    """
+    Quick HEAD request to confirm a URL is reachable before spending time
+    on a full Playwright load. Returns False on 4xx/5xx or any network error.
+    """
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("User-Agent", "Mozilla/5.0 (compatible; warm-job-radar)")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status < 400
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Playwright page loading (shared browser, per-request context)
+# ---------------------------------------------------------------------------
+
+def _visit_page_playwright(url: str, timeout: int = 15000) -> str:
+    """
+    Load a URL inside its own browser context (thread-safe), click any
+    relevant nav links, and return the full body text.
+    """
     browser = _get_browser()
-    page = browser.new_page()
+    context = browser.new_context()
+    page    = context.new_page()
     try:
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         try:
-            page.wait_for_load_state("networkidle", timeout=8000)
+            page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass  # networkidle timeout is non-fatal; continue with what loaded
+            pass  # non-fatal; use whatever has loaded so far
 
-        # Look for nav elements pointing to job listings and click the best match
         for keyword in CAREERS_NAV_KEYWORDS:
             try:
                 locator = page.get_by_role("link", name=re.compile(keyword, re.IGNORECASE))
                 if locator.count() > 0:
                     locator.first.click()
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(2000)
                     break
             except Exception:
                 continue
 
         return page.inner_text("body") or ""
     except Exception as exc:
-        print(f"[Playwright] Failed to load {url}: {type(exc).__name__}")
+        print(f"[Playwright] {url}: {type(exc).__name__}")
         return ""
     finally:
         try:
-            page.close()
+            context.close()
         except Exception:
             pass
 
@@ -212,30 +225,64 @@ def _visit_page_playwright(url: str, timeout: int = 20000) -> str:
 # ---------------------------------------------------------------------------
 
 def _filter_job_text(raw_text: str) -> str:
-    """
-    Keep only paragraphs that contain job-related keywords.
-    Strips cookie banners, nav menus, footers, and legal boilerplate.
-    """
+    """Keep only paragraphs that contain job-related keywords."""
     paragraphs = re.split(r"\n{2,}|\r\n{2,}", raw_text)
-    kept = []
-    for para in paragraphs:
-        lower = para.lower()
-        if any(kw in lower for kw in JOB_TEXT_KEYWORDS):
-            # Drop very short noise lines
-            if len(para.strip()) > 40:
-                kept.append(para.strip())
+    kept = [
+        p.strip() for p in paragraphs
+        if len(p.strip()) > 40 and any(kw in p.lower() for kw in JOB_TEXT_KEYWORDS)
+    ]
     return "\n\n".join(kept)
 
 
 # ---------------------------------------------------------------------------
-# Local keyword pre-screen (skip Claude if clearly irrelevant)
+# Local keyword pre-screen
 # ---------------------------------------------------------------------------
 
-def _text_likely_relevant(text: str, job_title: str) -> bool:
-    """Quick check: does the text contain any word from the job title?"""
-    title_words = {w.lower() for w in re.split(r"\W+", job_title) if len(w) > 2}
+def _text_likely_relevant(text: str, job_titles: list[str]) -> bool:
+    """Return True if the text contains any word from any of the job title variants."""
+    all_words = set()
+    for title in job_titles:
+        all_words |= {w.lower() for w in re.split(r"\W+", title) if len(w) > 2}
     lower_text = text.lower()
-    return any(word in lower_text for word in title_words)
+    return any(word in lower_text for word in all_words)
+
+
+# ---------------------------------------------------------------------------
+# Job title synonym expansion
+# ---------------------------------------------------------------------------
+
+def expand_job_title(job_title: str) -> list[str]:
+    """
+    Call Claude Haiku once to produce 6-8 synonym/variant job titles.
+    Results are cached for 24h so repeat searches cost nothing.
+    """
+    cache_key = _synonyms_cache_key(job_title)
+    cached    = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    client = anthropic.Anthropic()
+    prompt = (
+        f"List 6-8 job title variants that are the same or very similar role to: {job_title}\n"
+        f"Include abbreviations, alternative names, and closely related titles.\n"
+        f'Return ONLY a JSON array of lowercase strings. Example: ["customer success manager", "csm", "account manager"]'
+    )
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL_EXTRACT,
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        synonyms   = json.loads(raw)
+        all_titles = list({job_title.lower()} | {s.lower() for s in synonyms if isinstance(s, str)})
+        _cache_set(cache_key, all_titles)
+        return all_titles
+    except Exception as exc:
+        print(f"[Claude] Title expansion failed: {exc}")
+        return [job_title.lower()]
 
 
 # ---------------------------------------------------------------------------
@@ -244,37 +291,28 @@ def _text_likely_relevant(text: str, job_title: str) -> bool:
 
 def _ask_claude_batch(
     company_texts: list[dict],
-    job_title: str,
+    job_titles: list[str],
     location: str,
 ) -> dict[str, list]:
     """
-    Send up to one batch of companies to Claude (Haiku) for role extraction.
-
-    company_texts: list of {"company": str, "text": str}
-    Returns: dict mapping company name -> list of {"role_title": str, "url": str}
+    Send a batch of companies to Claude Haiku for role extraction.
+    job_titles is the expanded list of synonym titles.
     """
     client = anthropic.Anthropic()
 
-    blocks = []
-    for item in company_texts:
-        blocks.append(
-            f"### COMPANY: {item['company']}\n\n{item['text'][:2000]}"
-        )
-
+    blocks   = [f"### COMPANY: {item['company']}\n\n{item['text'][:2000]}" for item in company_texts]
     combined = "\n\n---\n\n".join(blocks)
+    titles   = ", ".join(f'"{t}"' for t in job_titles)
 
     prompt = (
         f"You are a job-search assistant. Below are careers page extracts from several companies.\n"
-        f"The user is looking for open roles matching or similar to: **{job_title}**.\n"
-        f"Location filter: only include roles that are based in, or explicitly open to remote "
-        f"candidates in, **{location}**. Ignore roles that are EU-only, outside {location}, "
-        f"or have no location information at all.\n\n"
-        f"For each company, return a JSON object with the company name as key and a list of "
-        f'matched roles as value. Each role: {{"role_title": str, "url": str}}. '
-        f'If no match, use an empty list.\n\n'
-        f"Return ONLY valid JSON. Example:\n"
-        f'{{"Acme Corp": [{{"role_title": "Product Manager", "url": "https://..."}}], '
-        f'"Beta Inc": []}}\n\n'
+        f"The user is looking for open roles matching or similar to ANY of these titles: {titles}.\n"
+        f"These are all names for essentially the same type of role — match any of them.\n"
+        f"Location filter: only include roles based in, or explicitly open to remote candidates in, "
+        f"**{location}**. Ignore EU-only or unlocated roles.\n\n"
+        f"For each company return a JSON object: company name as key, list of matched roles as value.\n"
+        f'Each role: {{"role_title": str, "url": str}}. Empty list if no match.\n\n'
+        f"Return ONLY valid JSON.\n\n"
         f"Page extracts:\n\n{combined}"
     )
 
@@ -285,7 +323,6 @@ def _ask_claude_batch(
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        # Strip markdown code fences if present
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         return json.loads(raw)
@@ -327,30 +364,32 @@ def generate_referral_message(
 def search_company(
     company: str,
     connections: list[dict],
-    job_title: str,
+    job_titles: list[str],
     location: str,
     state: dict,
     lock: threading.Lock,
 ) -> list[dict]:
     """
     Three-tier search for open roles at `company`.
-    Returns list of result dicts; also updates shared `state` under `lock`.
+    job_titles is the expanded synonym list from expand_job_title().
     """
     results = []
 
     try:
-        # --- Tier 1: probe the company's own careers page directly ---
-        page_key = _page_cache_key(company)
+        # --- Tier 1: probe the company's own careers page ---
+        page_key    = _page_cache_key(company)
         cached_text = _cache_get(page_key)
 
         if cached_text:
             raw_text = cached_text
-            tier = "Tier 1 (cached)"
+            tier     = "Tier 1 (cached)"
         else:
             raw_text = ""
-            tier = "Tier 1"
+            tier     = "Tier 1"
             for url in _tier1_url_patterns(company):
-                text = _visit_page_playwright(url, timeout=8000)
+                if not _url_likely_exists(url):
+                    continue
+                text = _visit_page_playwright(url)
                 if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
                     raw_text = text
                     break
@@ -359,42 +398,45 @@ def search_company(
 
         filtered = _filter_job_text(raw_text)
 
-        # --- Tier 2: try Greenhouse / Lever / Ashby URL patterns ---
+        # --- Tier 2: try Greenhouse / Lever / Ashby ---
         if len(filtered) < MIN_USEFUL_CONTENT_CHARS:
-            tier = "Tier 2"
+            tier      = "Tier 2"
             raw_text2 = ""
             for url in _tier2_url_patterns(company):
-                text = _visit_page_playwright(url, timeout=8000)
+                if not _url_likely_exists(url):
+                    continue
+                text = _visit_page_playwright(url)
                 if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
                     raw_text2 += "\n\n" + text
             filtered2 = _filter_job_text(raw_text2)
             if len(filtered2) >= len(filtered):
                 filtered = filtered2
 
-        # --- Local pre-screen: skip Claude if text is clearly irrelevant ---
-        if len(filtered) < MIN_USEFUL_CONTENT_CHARS or not _text_likely_relevant(filtered, job_title):
+        # --- Skip Claude if text is too thin or clearly off-topic ---
+        if len(filtered) < MIN_USEFUL_CONTENT_CHARS or not _text_likely_relevant(filtered, job_titles):
             results = _build_rows(company, connections, [], tier + " — no match")
             return results
 
         # --- Claude extraction (with output cache) ---
-        claude_key = _claude_cache_key(company, job_title, filtered)
+        claude_key   = _claude_cache_key(company, job_titles, filtered)
         cached_roles = _cache_get(claude_key)
 
         if cached_roles is not None:
             matched_roles = cached_roles
         else:
-            batch_result = _ask_claude_batch(
+            batch_result  = _ask_claude_batch(
                 [{"company": company, "text": filtered}],
-                job_title,
+                job_titles,
                 location,
             )
             matched_roles = batch_result.get(company, [])
             _cache_set(claude_key, matched_roles)
 
-        if matched_roles:
-            results = _build_rows(company, connections, matched_roles, tier)
-        else:
-            results = _build_rows(company, connections, [], tier + " — no match")
+        results = (
+            _build_rows(company, connections, matched_roles, tier)
+            if matched_roles
+            else _build_rows(company, connections, [], tier + " — no match")
+        )
 
     except Exception as exc:
         print(f"[search] Error processing {company}: {type(exc).__name__}: {exc}")
@@ -421,23 +463,23 @@ def _build_rows(
     if not roles:
         for conn in connections:
             rows.append({
-                "company": company,
-                "role_title": "—",
-                "connection_name": conn["name"],
+                "company":          company,
+                "role_title":       "—",
+                "connection_name":  conn["name"],
                 "connection_title": conn["title"],
-                "source": source,
-                "job_url": "",
+                "source":           source,
+                "job_url":          "",
             })
     else:
         for role in roles:
             for conn in connections:
                 rows.append({
-                    "company": company,
-                    "role_title": role.get("role_title", ""),
-                    "connection_name": conn["name"],
+                    "company":          company,
+                    "role_title":       role.get("role_title", ""),
+                    "connection_name":  conn["name"],
                     "connection_title": conn["title"],
-                    "source": source,
-                    "job_url": role.get("url", ""),
+                    "source":           source,
+                    "job_url":          role.get("url", ""),
                 })
     return rows
 
@@ -452,18 +494,21 @@ def run_search(
     location: str,
     state: dict,
     lock: threading.Lock,
-    max_workers: int = 3,
+    max_workers: int = 2,
 ):
     """
-    Process all companies concurrently. Batches Claude calls for efficiency.
-    This function blocks until all companies are processed.
+    Expand the job title into synonyms, then process all companies concurrently.
     """
     import concurrent.futures
+
+    # One-time synonym expansion before spawning workers
+    job_titles = expand_job_title(job_title)
+    print(f"[search] Searching for: {job_titles}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                search_company, company, connections, job_title, location, state, lock
+                search_company, company, connections, job_titles, location, state, lock
             ): company
             for company, connections in company_map.items()
         }
