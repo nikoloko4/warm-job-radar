@@ -1,5 +1,5 @@
 """
-Core search logic: Google CSE, Playwright page loading, Claude API calls, caching.
+Core search logic: direct URL probing, Playwright page loading, Claude API calls, caching.
 """
 
 import hashlib
@@ -8,12 +8,10 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
@@ -25,11 +23,13 @@ load_dotenv()
 CLAUDE_MODEL_EXTRACT = "claude-haiku-4-5-20251001"   # cheap model for role extraction
 CLAUDE_MODEL_REFERRAL = "claude-sonnet-4-6"           # quality model for referral messages
 
-FALLBACK_PLATFORMS = [
-    {"name": "Greenhouse", "domain": "greenhouse.io"},
-    {"name": "Lever",      "domain": "lever.co"},
-    {"name": "Ashby",      "domain": "jobs.ashbyhq.com"},
-]
+# Common corporate suffixes to strip when deriving a domain slug from a company name
+_CORP_SUFFIXES = re.compile(
+    r"\b(inc\.?|llc\.?|ltd\.?|corp\.?|co\.?|corporation|company|group|holdings?|"
+    r"international|technologies?|solutions?|services?|systems?|enterprises?|"
+    r"ventures?|labs?)\b",
+    re.IGNORECASE,
+)
 
 # Clickable nav elements to look for on careers pages
 CAREERS_NAV_KEYWORDS = [
@@ -126,47 +126,47 @@ def _claude_cache_key(company: str, job_title: str, text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Custom Search
+# URL pattern generation (no external API needed)
 # ---------------------------------------------------------------------------
 
-def _cse_request(query: str, state: dict, lock: threading.Lock) -> list:
-    """Run a Google Custom Search query, return list of result URLs."""
-    api_key = os.environ["GOOGLE_API_KEY"]
-    cse_id = os.environ["GOOGLE_CSE_ID"]
+def _make_slugs(company: str) -> list[str]:
+    """Derive likely domain slugs from a company name."""
+    cleaned = _CORP_SUFFIXES.sub("", company)
+    cleaned = re.sub(r"[^a-zA-Z0-9\s-]", "", cleaned).strip().lower()
+    slug_plain = re.sub(r"[\s-]+", "", cleaned)       # "acme corp" → "acmecorp"
+    slug_hyphen = re.sub(r"\s+", "-", cleaned).strip("-")  # "acme corp" → "acme-corp"
+    seen = []
+    for s in [slug_plain, slug_hyphen]:
+        if s and s not in seen:
+            seen.append(s)
+    return seen
 
-    today = datetime.now(timezone.utc).date().isoformat()
-    with lock:
-        if state.get("cse_date") != today:
-            state["cse_date"] = today
-            state["cse_calls_today"] = 0
 
-    try:
-        service = build("customsearch", "v1", developerKey=api_key)
-        result = service.cse().list(q=query, cx=cse_id, num=3).execute()
-        urls = [item["link"] for item in result.get("items", [])]
-    except Exception as exc:
-        urls = []
-        # Log without exposing keys
-        print(f"[CSE] Query failed: {type(exc).__name__}: {exc}")
-
-    with lock:
-        state["cse_calls_today"] = state.get("cse_calls_today", 0) + 1
-
-    time.sleep(0.5)  # be polite to the free-tier rate limit
+def _tier1_url_patterns(company: str) -> list[str]:
+    """Return direct careers-page URL candidates for the company's own site."""
+    urls = []
+    for slug in _make_slugs(company):
+        urls += [
+            f"https://{slug}.com/careers",
+            f"https://{slug}.com/jobs",
+            f"https://careers.{slug}.com",
+            f"https://jobs.{slug}.com",
+            f"https://{slug}.com/work-with-us",
+            f"https://{slug}.com/join-us",
+        ]
     return urls
 
 
-def _tier1_google_cse(company: str, state: dict, lock: threading.Lock) -> list:
-    query = f'"{company}" careers OR jobs'
-    return _cse_request(query, state, lock)
-
-
-def _tier2_platform_cse(company: str, job_title: str, state: dict, lock: threading.Lock) -> list:
+def _tier2_url_patterns(company: str) -> list[str]:
+    """Return Greenhouse / Lever / Ashby URL candidates for the company."""
     urls = []
-    for platform in FALLBACK_PLATFORMS:
-        query = f'"{company}" "{job_title}" site:{platform["domain"]}'
-        results = _cse_request(query, state, lock)
-        urls.extend(results)
+    for slug in _make_slugs(company):
+        urls += [
+            f"https://boards.greenhouse.io/{slug}",
+            f"https://job-boards.greenhouse.io/{slug}",
+            f"https://jobs.lever.co/{slug}",
+            f"https://jobs.ashbyhq.com/{slug}",
+        ]
     return urls
 
 
@@ -174,12 +174,12 @@ def _tier2_platform_cse(company: str, job_title: str, state: dict, lock: threadi
 # Playwright page loading
 # ---------------------------------------------------------------------------
 
-def _visit_page_playwright(url: str) -> str:
+def _visit_page_playwright(url: str, timeout: int = 20000) -> str:
     """Load a URL with a real browser, click relevant nav links, return body text."""
     browser = _get_browser()
     page = browser.new_page()
     try:
-        page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
@@ -339,7 +339,7 @@ def search_company(
     results = []
 
     try:
-        # --- Tier 1: find the company's own careers page ---
+        # --- Tier 1: probe the company's own careers page directly ---
         page_key = _page_cache_key(company)
         cached_text = _cache_get(page_key)
 
@@ -347,26 +347,26 @@ def search_company(
             raw_text = cached_text
             tier = "Tier 1 (cached)"
         else:
-            urls = _tier1_google_cse(company, state, lock)
             raw_text = ""
             tier = "Tier 1"
-            for url in urls[:2]:
-                raw_text = _visit_page_playwright(url)
-                if raw_text:
+            for url in _tier1_url_patterns(company):
+                text = _visit_page_playwright(url, timeout=8000)
+                if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
+                    raw_text = text
                     break
             if raw_text:
                 _cache_set(page_key, raw_text)
 
         filtered = _filter_job_text(raw_text)
 
-        # Fall through to Tier 2 if content is too thin
+        # --- Tier 2: try Greenhouse / Lever / Ashby URL patterns ---
         if len(filtered) < MIN_USEFUL_CONTENT_CHARS:
-            urls2 = _tier2_platform_cse(company, job_title, state, lock)
             tier = "Tier 2"
             raw_text2 = ""
-            for url in urls2[:3]:
-                chunk = _visit_page_playwright(url)
-                raw_text2 += "\n\n" + chunk
+            for url in _tier2_url_patterns(company):
+                text = _visit_page_playwright(url, timeout=8000)
+                if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
+                    raw_text2 += "\n\n" + text
             filtered2 = _filter_job_text(raw_text2)
             if len(filtered2) >= len(filtered):
                 filtered = filtered2
