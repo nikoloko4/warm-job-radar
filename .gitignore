@@ -9,6 +9,7 @@ search_history.json
 *.csv
 .cache/
 cache.json
+checkpoint.json
 *.egg-info/
 dist/
 build/
