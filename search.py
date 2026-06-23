@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -200,6 +201,10 @@ def _url_likely_exists(url: str) -> bool:
         req.add_header("User-Agent", "Mozilla/5.0 (compatible; warm-job-radar)")
         with urllib.request.urlopen(req, timeout=3) as resp:
             return resp.status < 400
+    except urllib.error.HTTPError as e:
+        # 403 Forbidden / 405 Method Not Allowed means the server responded —
+        # the URL exists but rejects HEAD; let Playwright try it.
+        return e.code in (403, 405)
     except Exception:
         return False
 
