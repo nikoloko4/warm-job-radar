@@ -7,7 +7,9 @@ import json
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import anthropic
@@ -20,10 +22,9 @@ load_dotenv()
 # Constants
 # ---------------------------------------------------------------------------
 
-CLAUDE_MODEL_EXTRACT  = "claude-haiku-4-5-20251001"  # cheap model for role extraction
-CLAUDE_MODEL_REFERRAL = "claude-sonnet-4-6"           # quality model for referral messages
+CLAUDE_MODEL_EXTRACT  = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL_REFERRAL = "claude-sonnet-4-6"
 
-# Common corporate suffixes to strip when deriving a domain slug from a company name
 _CORP_SUFFIXES = re.compile(
     r"\b(inc\.?|llc\.?|ltd\.?|corp\.?|co\.?|corporation|company|group|holdings?|"
     r"international|technologies?|solutions?|services?|systems?|enterprises?|"
@@ -31,7 +32,6 @@ _CORP_SUFFIXES = re.compile(
     re.IGNORECASE,
 )
 
-# Clickable nav elements to look for on careers pages
 CAREERS_NAV_KEYWORDS = [
     "jobs", "roles", "openings", "view all", "all departments",
     "engineering", "product", "design", "careers", "positions",
@@ -39,7 +39,6 @@ CAREERS_NAV_KEYWORDS = [
 
 MIN_USEFUL_CONTENT_CHARS = 500
 
-# Keywords that indicate a paragraph is job-related (used for pre-filtering)
 JOB_TEXT_KEYWORDS = {
     "apply", "role", "position", "experience", "requirements", "full-time",
     "part-time", "qualifications", "responsibilities", "salary", "remote",
@@ -48,9 +47,10 @@ JOB_TEXT_KEYWORDS = {
 
 CACHE_FILE        = Path("cache.json")
 CACHE_TTL_SECONDS = 86400  # 24 hours
+CHECKPOINT_FILE   = Path("checkpoint.json")
 
 # ---------------------------------------------------------------------------
-# Single shared Playwright browser (one instance for the whole process)
+# Single shared Playwright browser
 # ---------------------------------------------------------------------------
 
 _browser_lock        = threading.Lock()
@@ -62,7 +62,7 @@ def _get_browser():
     global _browser, _playwright_instance
     if _browser is None:
         with _browser_lock:
-            if _browser is None:  # double-checked locking
+            if _browser is None:
                 _playwright_instance = sync_playwright().start()
                 _browser = _playwright_instance.chromium.launch(headless=True)
     return _browser
@@ -120,11 +120,40 @@ def _synonyms_cache_key(job_title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint (lets the user resume a long search after stopping)
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(job_title: str, location: str, done_companies: list[str], results: list[dict]):
+    try:
+        CHECKPOINT_FILE.write_text(json.dumps({
+            "job_title":      job_title,
+            "location":       location,
+            "done_companies": done_companies,
+            "results":        results,
+        }, indent=2))
+    except Exception as exc:
+        print(f"[checkpoint] Save failed: {exc}")
+
+
+def load_checkpoint() -> dict | None:
+    if not CHECKPOINT_FILE.exists():
+        return None
+    try:
+        return json.loads(CHECKPOINT_FILE.read_text())
+    except Exception:
+        return None
+
+
+def clear_checkpoint():
+    if CHECKPOINT_FILE.exists():
+        CHECKPOINT_FILE.unlink()
+
+
+# ---------------------------------------------------------------------------
 # URL pattern generation
 # ---------------------------------------------------------------------------
 
 def _make_slugs(company: str) -> list[str]:
-    """Derive likely domain slugs from a company name."""
     cleaned     = _CORP_SUFFIXES.sub("", company)
     cleaned     = re.sub(r"[^a-zA-Z0-9\s-]", "", cleaned).strip().lower()
     slug_plain  = re.sub(r"[\s-]+", "", cleaned)
@@ -163,32 +192,48 @@ def _tier2_url_patterns(company: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Fast HTTP pre-check (stdlib only, no extra dependency)
+# Fast HTTP pre-check + parallel URL discovery
 # ---------------------------------------------------------------------------
 
 def _url_likely_exists(url: str) -> bool:
-    """
-    Quick HEAD request to confirm a URL is reachable before spending time
-    on a full Playwright load. Returns False on 4xx/5xx or any network error.
-    """
     try:
         req = urllib.request.Request(url, method="HEAD")
         req.add_header("User-Agent", "Mozilla/5.0 (compatible; warm-job-radar)")
         with urllib.request.urlopen(req, timeout=3) as resp:
             return resp.status < 400
+    except urllib.error.HTTPError as e:
+        # 403 Forbidden / 405 Method Not Allowed means the server responded —
+        # the URL exists but rejects HEAD; let Playwright try it.
+        return e.code in (403, 405)
     except Exception:
         return False
 
 
+def _find_first_live_url(urls: list[str]) -> str | None:
+    """
+    Check all candidate URLs in parallel and return the highest-priority
+    one (earliest in the list) that actually responds with a 2xx/3xx.
+    """
+    if not urls:
+        return None
+    live: set[str] = set()
+    with ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        futures = {ex.submit(_url_likely_exists, url): url for url in urls}
+        for future in as_completed(futures):
+            if future.result():
+                live.add(futures[future])
+    # Preserve original priority order
+    for url in urls:
+        if url in live:
+            return url
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Playwright page loading (shared browser, per-request context)
+# Playwright page loading
 # ---------------------------------------------------------------------------
 
 def _visit_page_playwright(url: str, timeout: int = 15000) -> str:
-    """
-    Load a URL inside its own browser context (thread-safe), click any
-    relevant nav links, and return the full body text.
-    """
     browser = _get_browser()
     context = browser.new_context()
     page    = context.new_page()
@@ -197,7 +242,7 @@ def _visit_page_playwright(url: str, timeout: int = 15000) -> str:
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass  # non-fatal; use whatever has loaded so far
+            pass
 
         for keyword in CAREERS_NAV_KEYWORDS:
             try:
@@ -225,7 +270,6 @@ def _visit_page_playwright(url: str, timeout: int = 15000) -> str:
 # ---------------------------------------------------------------------------
 
 def _filter_job_text(raw_text: str) -> str:
-    """Keep only paragraphs that contain job-related keywords."""
     paragraphs = re.split(r"\n{2,}|\r\n{2,}", raw_text)
     kept = [
         p.strip() for p in paragraphs
@@ -234,13 +278,8 @@ def _filter_job_text(raw_text: str) -> str:
     return "\n\n".join(kept)
 
 
-# ---------------------------------------------------------------------------
-# Local keyword pre-screen
-# ---------------------------------------------------------------------------
-
 def _text_likely_relevant(text: str, job_titles: list[str]) -> bool:
-    """Return True if the text contains any word from any of the job title variants."""
-    all_words = set()
+    all_words  = set()
     for title in job_titles:
         all_words |= {w.lower() for w in re.split(r"\W+", title) if len(w) > 2}
     lower_text = text.lower()
@@ -252,10 +291,6 @@ def _text_likely_relevant(text: str, job_titles: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 def expand_job_title(job_title: str) -> list[str]:
-    """
-    Call Claude Haiku once to produce 6-8 synonym/variant job titles.
-    Results are cached for 24h so repeat searches cost nothing.
-    """
     cache_key = _synonyms_cache_key(job_title)
     cached    = _cache_get(cache_key)
     if cached is not None:
@@ -273,10 +308,10 @@ def expand_job_title(job_title: str) -> list[str]:
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = response.content[0].text.strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        synonyms   = json.loads(raw)
+        raw       = response.content[0].text.strip()
+        raw       = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw       = re.sub(r"\s*```$", "", raw)
+        synonyms  = json.loads(raw)
         all_titles = list({job_title.lower()} | {s.lower() for s in synonyms if isinstance(s, str)})
         _cache_set(cache_key, all_titles)
         return all_titles
@@ -294,12 +329,7 @@ def _ask_claude_batch(
     job_titles: list[str],
     location: str,
 ) -> dict[str, list]:
-    """
-    Send a batch of companies to Claude Haiku for role extraction.
-    job_titles is the expanded list of synonym titles.
-    """
-    client = anthropic.Anthropic()
-
+    client   = anthropic.Anthropic()
     blocks   = [f"### COMPANY: {item['company']}\n\n{item['text'][:2000]}" for item in company_texts]
     combined = "\n\n---\n\n".join(blocks)
     titles   = ", ".join(f'"{t}"' for t in job_titles)
@@ -337,7 +367,6 @@ def generate_referral_message(
     connection_name: str,
     connection_title: str,
 ) -> str:
-    """Draft a personalised LinkedIn referral message using Claude Sonnet."""
     client = anthropic.Anthropic()
     prompt = (
         f"Write a warm, concise LinkedIn message (150 words max) asking "
@@ -358,7 +387,7 @@ def generate_referral_message(
 
 
 # ---------------------------------------------------------------------------
-# Per-company search (runs in a worker thread)
+# Per-company search
 # ---------------------------------------------------------------------------
 
 def search_company(
@@ -369,14 +398,10 @@ def search_company(
     state: dict,
     lock: threading.Lock,
 ) -> list[dict]:
-    """
-    Three-tier search for open roles at `company`.
-    job_titles is the expanded synonym list from expand_job_title().
-    """
     results = []
 
     try:
-        # --- Tier 1: probe the company's own careers page ---
+        # --- Tier 1: probe company's own careers page (parallel pre-checks) ---
         page_key    = _page_cache_key(company)
         cached_text = _cache_get(page_key)
 
@@ -386,33 +411,26 @@ def search_company(
         else:
             raw_text = ""
             tier     = "Tier 1"
-            for url in _tier1_url_patterns(company):
-                if not _url_likely_exists(url):
-                    continue
-                text = _visit_page_playwright(url)
-                if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
-                    raw_text = text
-                    break
+            best_url = _find_first_live_url(_tier1_url_patterns(company))
+            if best_url:
+                raw_text = _visit_page_playwright(best_url)
             if raw_text:
                 _cache_set(page_key, raw_text)
 
         filtered = _filter_job_text(raw_text)
 
-        # --- Tier 2: try Greenhouse / Lever / Ashby ---
+        # --- Tier 2: Greenhouse / Lever / Ashby (parallel pre-checks) ---
         if len(filtered) < MIN_USEFUL_CONTENT_CHARS:
             tier      = "Tier 2"
             raw_text2 = ""
-            for url in _tier2_url_patterns(company):
-                if not _url_likely_exists(url):
-                    continue
-                text = _visit_page_playwright(url)
-                if text and len(text.strip()) > MIN_USEFUL_CONTENT_CHARS:
-                    raw_text2 += "\n\n" + text
+            best_url2 = _find_first_live_url(_tier2_url_patterns(company))
+            if best_url2:
+                raw_text2 = _visit_page_playwright(best_url2)
             filtered2 = _filter_job_text(raw_text2)
             if len(filtered2) >= len(filtered):
                 filtered = filtered2
 
-        # --- Skip Claude if text is too thin or clearly off-topic ---
+        # --- Skip Claude if content is too thin or off-topic ---
         if len(filtered) < MIN_USEFUL_CONTENT_CHARS or not _text_likely_relevant(filtered, job_titles):
             results = _build_rows(company, connections, [], tier + " — no match")
             return results
@@ -448,44 +466,40 @@ def search_company(
         with lock:
             state["results"].extend(results)
             state["done"] += 1
+            # Save checkpoint after every completed company
+            save_checkpoint(
+                state.get("job_title", ""),
+                state.get("location", ""),
+                state.get("done_companies", []) + [company],
+                list(state["results"]),
+            )
+            state.setdefault("done_companies", []).append(company)
 
     return results
 
 
-def _build_rows(
-    company: str,
-    connections: list[dict],
-    roles: list[dict],
-    source: str,
-) -> list[dict]:
-    """Expand roles × connections into DataTable rows."""
+def _build_rows(company, connections, roles, source):
     rows = []
     if not roles:
         for conn in connections:
             rows.append({
-                "company":          company,
-                "role_title":       "—",
-                "connection_name":  conn["name"],
-                "connection_title": conn["title"],
-                "source":           source,
-                "job_url":          "",
+                "company": company, "role_title": "—",
+                "connection_name": conn["name"], "connection_title": conn["title"],
+                "source": source, "job_url": "",
             })
     else:
         for role in roles:
             for conn in connections:
                 rows.append({
-                    "company":          company,
-                    "role_title":       role.get("role_title", ""),
-                    "connection_name":  conn["name"],
-                    "connection_title": conn["title"],
-                    "source":           source,
-                    "job_url":          role.get("url", ""),
+                    "company": company, "role_title": role.get("role_title", ""),
+                    "connection_name": conn["name"], "connection_title": conn["title"],
+                    "source": source, "job_url": role.get("url", ""),
                 })
     return rows
 
 
 # ---------------------------------------------------------------------------
-# Batch runner — called from app.py background thread
+# Batch runner
 # ---------------------------------------------------------------------------
 
 def run_search(
@@ -494,25 +508,42 @@ def run_search(
     location: str,
     state: dict,
     lock: threading.Lock,
-    max_workers: int = 2,
+    max_workers: int = 5,
+    resume_from: dict | None = None,
 ):
     """
     Expand the job title into synonyms, then process all companies concurrently.
+    Pass resume_from=load_checkpoint() to skip already-completed companies.
     """
-    import concurrent.futures
-
-    # One-time synonym expansion before spawning workers
     job_titles = expand_job_title(job_title)
     print(f"[search] Searching for: {job_titles}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Store job metadata in state so checkpoint can reference it
+    with lock:
+        state["job_title"]      = job_title
+        state["location"]       = location
+        state["done_companies"] = []
+
+    # Seed state from checkpoint if resuming
+    if resume_from:
+        done_set = set(resume_from.get("done_companies", []))
+        with lock:
+            state["results"]        = list(resume_from.get("results", []))
+            state["done"]           = len(done_set)
+            state["done_companies"] = list(done_set)
+        remaining = {c: v for c, v in company_map.items() if c not in done_set}
+    else:
+        clear_checkpoint()
+        remaining = company_map
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 search_company, company, connections, job_titles, location, state, lock
             ): company
-            for company, connections in company_map.items()
+            for company, connections in remaining.items()
         }
-        for future in concurrent.futures.as_completed(futures):
+        for future in as_completed(futures):
             company = futures[future]
             try:
                 future.result()
@@ -521,3 +552,5 @@ def run_search(
 
     with lock:
         state["running"] = False
+
+    clear_checkpoint()
