@@ -34,9 +34,6 @@ MIN_USEFUL_CONTENT_CHARS = 300
 
 CACHE_FILE        = Path("cache.json")
 CACHE_TTL_SECONDS = 86400
-CACHE_EMPTY_TTL   = 21600   # 6h for "no career page found" entries
-
-SKIP_PLAYWRIGHT = os.getenv("SKIP_PLAYWRIGHT", "false").lower() == "true"
 CHECKPOINT_FILE   = Path("checkpoint.json")
 
 _HTTP_HEADERS = {
@@ -62,32 +59,27 @@ JOB_TEXT_KEYWORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Playwright — pool of dedicated threads, each with its own Chromium process.
-# Playwright's sync API uses greenlets bound to one thread, so each worker
-# owns its queue exclusively. Requests are round-robined across workers.
-# PW_WORKERS=2 by default — each worker is one Chromium process.
+# Playwright — single dedicated thread with a task queue
+# Playwright's sync API uses greenlets bound to one thread.
+# All browser calls go through this queue so there's exactly one Chromium process.
 # ---------------------------------------------------------------------------
 
-_PW_WORKERS  : int                         = max(1, int(os.getenv("PW_WORKERS", "2")))
-_pw_queues   : list[queue.Queue]           = [queue.Queue() for _ in range(_PW_WORKERS)]
-_pw_results  : dict                        = {}
-_pw_lock                                   = threading.Lock()
-_pw_threads  : list[threading.Thread | None] = [None] * _PW_WORKERS
-_pw_rr_lock                                = threading.Lock()
-_pw_rr_idx   : int                         = 0
+_pw_queue   : queue.Queue = queue.Queue()
+_pw_results : dict        = {}
+_pw_lock                  = threading.Lock()
+_pw_thread  : threading.Thread | None = None
 
 
-def _playwright_worker(worker_idx: int):
+def _playwright_worker():
     """Runs in its own thread; restarts Chromium automatically if it crashes."""
-    q = _pw_queues[worker_idx]
     while True:
         try:
             pw      = sync_playwright().start()
             browser = pw.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-            print(f"[playwright:{worker_idx}] Browser started")
+            print("[playwright] Browser started")
             while True:
-                item = q.get()
-                if item is None:
+                item = _pw_queue.get()
+                if item is None:          # sentinel — shut down
                     browser.close()
                     pw.stop()
                     return
@@ -104,7 +96,7 @@ def _playwright_worker(worker_idx: int):
                             pass
                         text = page.inner_text("body") or ""
                     except Exception as exc:
-                        print(f"[playwright:{worker_idx}] {url}: {type(exc).__name__}")
+                        print(f"[playwright] {url}: {type(exc).__name__}")
                     finally:
                         ctx.close()
                 except Exception:
@@ -113,30 +105,22 @@ def _playwright_worker(worker_idx: int):
                     _pw_results[req_id] = text
                 event.set()
         except Exception as exc:
-            print(f"[playwright:{worker_idx}] Worker crashed ({exc}), restarting in 3s…")
+            print(f"[playwright] Worker crashed ({exc}), restarting in 3s…")
             time.sleep(3)
 
 
 def _ensure_playwright():
-    for i in range(_PW_WORKERS):
-        if _pw_threads[i] is None or not _pw_threads[i].is_alive():
-            t = threading.Thread(
-                target=_playwright_worker, args=(i,),
-                daemon=True, name=f"playwright-{i}",
-            )
-            t.start()
-            _pw_threads[i] = t
+    global _pw_thread
+    if _pw_thread is None or not _pw_thread.is_alive():
+        _pw_thread = threading.Thread(target=_playwright_worker, daemon=True, name="playwright")
+        _pw_thread.start()
 
 
 def _playwright_fetch(url: str, timeout: float = 20.0) -> str:
-    global _pw_rr_idx
     _ensure_playwright()
-    with _pw_rr_lock:
-        idx = _pw_rr_idx % _PW_WORKERS
-        _pw_rr_idx += 1
     req_id = f"{time.monotonic()}:{url}"
     event  = threading.Event()
-    _pw_queues[idx].put((req_id, url, event))
+    _pw_queue.put((req_id, url, event))
     if not event.wait(timeout=timeout):
         with _pw_lock:
             _pw_results.pop(req_id, None)
@@ -169,21 +153,20 @@ def _init_cache():
 _init_cache()
 
 
-def _cache_get(key: str, ttl: int = CACHE_TTL_SECONDS):
+def _cache_get(key: str):
     with _cache_lock:
         entry = _cache_data.get(key)
         if not entry:
             return None
-        effective_ttl = entry.get("ttl", ttl)
-        if time.time() - entry.get("ts", 0) > effective_ttl:
+        if time.time() - entry.get("ts", 0) > CACHE_TTL_SECONDS:
             return None
         return entry.get("value")
 
 
-def _cache_set(key: str, value, ttl: int = CACHE_TTL_SECONDS):
+def _cache_set(key: str, value):
     global _cache_write_count
     with _cache_lock:
-        _cache_data[key] = {"value": value, "ts": time.time(), "ttl": ttl}
+        _cache_data[key] = {"value": value, "ts": time.time()}
         _cache_write_count += 1
         if _cache_write_count % _CACHE_FLUSH_EVERY == 0:
             CACHE_FILE.write_text(json.dumps(_cache_data, indent=2))
@@ -580,7 +563,7 @@ def _search_platforms_parallel(
 def _http_fetch_text(url: str) -> str:
     try:
         resp = _requests.get(
-            url, headers=_HTTP_HEADERS, timeout=3, allow_redirects=True,
+            url, headers=_HTTP_HEADERS, timeout=6, allow_redirects=True,
         )
         if resp.status_code >= 400:
             return ""
@@ -767,10 +750,8 @@ def search_company(
             page_key    = f"page:{hashlib.sha256(company.lower().encode()).hexdigest()}"
             cached_text = _cache_get(page_key)
 
-            _EMPTY_SENTINEL = "__empty__"
-
             if cached_text is not None:
-                raw_text  = "" if cached_text == _EMPTY_SENTINEL else cached_text
+                raw_text  = cached_text
                 http_tier = "HTTP (cached)"
             else:
                 raw_text  = ""
@@ -795,17 +776,14 @@ def search_company(
                         pw_candidate = url  # thin — probably a JS SPA
 
                 # Fall back to Playwright only if all HTTP fetches were too thin
-                if not raw_text and pw_candidate and not SKIP_PLAYWRIGHT:
+                if not raw_text and pw_candidate:
                     pw_text = _playwright_fetch(pw_candidate)
                     if len(pw_text) > MIN_USEFUL_CONTENT_CHARS:
                         raw_text  = pw_text
                         http_tier = "HTTP+JS"
 
-                # Cache result; use short TTL for empty so we retry sooner
                 if raw_text:
                     _cache_set(page_key, raw_text)
-                else:
-                    _cache_set(page_key, _EMPTY_SENTINEL, ttl=CACHE_EMPTY_TTL)
 
             filtered = _filter_job_text(raw_text)
 
