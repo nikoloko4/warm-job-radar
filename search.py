@@ -89,9 +89,9 @@ def _playwright_worker():
                     ctx  = browser.new_context()
                     page = ctx.new_page()
                     try:
-                        page.goto(url, timeout=10000, wait_until="domcontentloaded")
+                        page.goto(url, timeout=7000, wait_until="domcontentloaded")
                         try:
-                            page.wait_for_load_state("networkidle", timeout=3000)
+                            page.wait_for_load_state("networkidle", timeout=1500)
                         except Exception:
                             pass
                         text = page.inner_text("body") or ""
@@ -116,7 +116,7 @@ def _ensure_playwright():
         _pw_thread.start()
 
 
-def _playwright_fetch(url: str, timeout: float = 30.0) -> str:
+def _playwright_fetch(url: str, timeout: float = 20.0) -> str:
     _ensure_playwright()
     req_id = f"{time.monotonic()}:{url}"
     event  = threading.Event()
@@ -421,32 +421,90 @@ def _search_ashby(slug: str, job_titles: list[str], location: str) -> list[dict]
         return None
 
 
+def _search_smartrecruiters(slug: str, job_titles: list[str], location: str) -> list[dict] | None:
+    """Returns matched roles, or None if the company is not on SmartRecruiters."""
+    neg_key = f"sr404:{slug}"
+    if _cache_get(neg_key) is not None:
+        return None
+    try:
+        resp = _requests.get(
+            f"https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+            params={"limit": 100},
+            headers=_HTTP_HEADERS, timeout=2,
+        )
+        if resp.status_code == 404:
+            _cache_set(neg_key, True)
+            return None
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        postings = data.get("content") or []
+        if not postings and data.get("totalFound", -1) == 0:
+            _cache_set(neg_key, True)
+            return None
+        results = []
+        for p in postings:
+            title = p.get("name", "")
+            loc   = p.get("location") or {}
+            loc_str = " ".join(filter(None, [loc.get("city", ""), loc.get("country", "")]))
+            url   = p.get("ref", "") or p.get("jobAdUrl", "")
+            if _title_matches(title, job_titles) and _location_ok(loc_str + " " + title, location):
+                results.append({"role_title": title, "url": url})
+        return results
+    except Exception:
+        return None
+
+
+def _search_workable(slug: str, job_titles: list[str], location: str) -> list[dict] | None:
+    """Returns matched roles, or None if the company is not on Workable."""
+    neg_key = f"wk404:{slug}"
+    if _cache_get(neg_key) is not None:
+        return None
+    try:
+        resp = _requests.get(
+            f"https://apply.workable.com/api/v3/accounts/{slug}/jobs",
+            headers=_HTTP_HEADERS, timeout=2,
+        )
+        if resp.status_code == 404:
+            _cache_set(neg_key, True)
+            return None
+        if resp.status_code != 200:
+            return None
+        postings = resp.json().get("results") or []
+        if not postings:
+            _cache_set(neg_key, True)
+            return None
+        results = []
+        for p in postings:
+            title = p.get("title", "")
+            loc   = p.get("location") or {}
+            loc_str = " ".join(filter(None, [loc.get("city", ""), loc.get("country", "")]))
+            if loc.get("remote"):
+                loc_str = "remote " + loc_str
+            url = p.get("url", "")
+            if _title_matches(title, job_titles) and _location_ok(loc_str + " " + title, location):
+                results.append({"role_title": title, "url": url})
+        return results
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Tier 1 parallel runner — all platforms × all slugs simultaneously
 # ---------------------------------------------------------------------------
 
-def _search_platforms_parallel(
-    company: str,
+def _run_platform_phase(
+    slugs: list[str],
+    platforms: list[tuple],
     job_titles: list[str],
     location: str,
 ) -> tuple[list[dict], str]:
-    """
-    Fire every platform+slug combination at once and pick the highest-priority
-    result. Priority order: Greenhouse > Lever > Ashby.
-    Returns (matched_roles, source_label) or ([], "") if not on any platform.
-    """
-    slugs     = _make_slugs(company)
-    platforms = [
-        ("Greenhouse", _search_greenhouse),
-        ("Lever",      _search_lever),
-        ("Ashby",      _search_ashby),
-    ]
+    """Fire all slug×platform combos in parallel; return highest-priority hit or ("", "")."""
     tasks = [
         (prio, slug_i, name, fn, slug)
         for prio, (name, fn) in enumerate(platforms)
         for slug_i, slug in enumerate(slugs)
     ]
-
     hits: dict[tuple, tuple] = {}
     with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
         futures = {
@@ -457,20 +515,45 @@ def _search_platforms_parallel(
             prio, slug_i, name = futures[future]
             try:
                 result = future.result()
-                if result is not None:       # None means "company not on this platform"
+                if result is not None:
                     hits[(prio, slug_i)] = (result, name)
             except Exception:
                 pass
 
-    # Return the highest-priority (lowest prio number, then lowest slug_i) hit
     for prio in range(len(platforms)):
         for slug_i in range(len(slugs)):
             if (prio, slug_i) in hits:
                 roles, name = hits[(prio, slug_i)]
-                source = name if roles else f"{name} — no match"
-                return roles, source
-
+                return roles, name if roles else f"{name} — no match"
     return [], ""
+
+
+def _search_platforms_parallel(
+    company: str,
+    job_titles: list[str],
+    location: str,
+) -> tuple[list[dict], str]:
+    """
+    Two-phase search: fire Greenhouse/Lever/Ashby first; only try
+    SmartRecruiters/Workable if the fast tier found nothing.
+    This keeps latency low for the ~80% of companies already on the fast platforms.
+    """
+    slugs = _make_slugs(company)
+
+    roles, source = _run_platform_phase(
+        slugs,
+        [("Greenhouse", _search_greenhouse), ("Lever", _search_lever), ("Ashby", _search_ashby)],
+        job_titles, location,
+    )
+    if source:
+        return roles, source
+
+    # Fallback phase: SmartRecruiters and Workable
+    return _run_platform_phase(
+        slugs,
+        [("SmartRecruiters", _search_smartrecruiters), ("Workable", _search_workable)],
+        job_titles, location,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -531,21 +614,31 @@ def _text_likely_relevant(text: str, job_titles: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 def expand_job_title(job_title: str) -> list[str]:
-    cache_key = f"synonyms:{hashlib.sha256(job_title.lower().encode()).hexdigest()}"
+    # bump version suffix to force regeneration when prompt changes
+    cache_key = f"synonyms_v3:{hashlib.sha256(job_title.lower().encode()).hexdigest()}"
     cached    = _cache_get(cache_key)
     if cached is not None:
         return cached
 
     client = Anthropic()
     prompt = (
-        f"List 6-8 job title variants that are the same or very similar role to: {job_title}\n"
-        f"Include abbreviations, alternative names, and closely related titles.\n"
-        f'Return ONLY a JSON array of lowercase strings. '
-        f'Example: ["customer success manager", "csm", "account manager"]'
+        f"List 10-15 job title variants for the EXACT SAME function as: {job_title}\n"
+        f"Include: common abbreviations (e.g. CSM, TAM), seniority variations "
+        f"(Senior, Lead, Principal, Director-level), and alternative titles used at "
+        f"SaaS/tech companies for the same post-sale role.\n"
+        f"Critical exclusions — do NOT include these unless they carry a qualifier "
+        f"like 'Expansion' or 'Renewal' that makes them post-sale:\n"
+        f"- 'Account Executive' or 'AE' (pre-sale quota roles) — EXCEPTION: "
+        f"'Expansion Account Executive' or 'Account Executive, Expansion' ARE acceptable\n"
+        f"- 'Sales Manager', 'Sales Representative', 'Business Development'\n"
+        f"- 'Customer Support', 'Technical Support', 'Help Desk', 'Service Desk'\n"
+        f"Only include titles where the PRIMARY responsibility is post-sale: "
+        f"retention, adoption, onboarding, renewals, or expansion.\n"
+        f"Return ONLY a JSON array of lowercase strings."
     )
     try:
         response  = client.messages.create(
-            model=CLAUDE_MODEL_EXTRACT, max_tokens=256,
+            model=CLAUDE_MODEL_EXTRACT, max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )
         raw       = response.content[0].text.strip()
@@ -554,6 +647,7 @@ def expand_job_title(job_title: str) -> list[str]:
         synonyms  = json.loads(raw)
         result    = list({job_title.lower()} | {s.lower() for s in synonyms if isinstance(s, str)})
         _cache_set(cache_key, result)
+        print(f"[search] Synonyms for '{job_title}': {result}")
         return result
     except Exception as exc:
         print(f"[claude] Title expansion failed: {exc}")
