@@ -34,6 +34,9 @@ MIN_USEFUL_CONTENT_CHARS = 300
 
 CACHE_FILE        = Path("cache.json")
 CACHE_TTL_SECONDS = 86400
+CACHE_EMPTY_TTL   = 21600   # 6h for "no career page found" entries
+
+SKIP_PLAYWRIGHT = os.getenv("SKIP_PLAYWRIGHT", "false").lower() == "true"
 CHECKPOINT_FILE   = Path("checkpoint.json")
 
 _HTTP_HEADERS = {
@@ -166,20 +169,21 @@ def _init_cache():
 _init_cache()
 
 
-def _cache_get(key: str):
+def _cache_get(key: str, ttl: int = CACHE_TTL_SECONDS):
     with _cache_lock:
         entry = _cache_data.get(key)
         if not entry:
             return None
-        if time.time() - entry.get("ts", 0) > CACHE_TTL_SECONDS:
+        effective_ttl = entry.get("ttl", ttl)
+        if time.time() - entry.get("ts", 0) > effective_ttl:
             return None
         return entry.get("value")
 
 
-def _cache_set(key: str, value):
+def _cache_set(key: str, value, ttl: int = CACHE_TTL_SECONDS):
     global _cache_write_count
     with _cache_lock:
-        _cache_data[key] = {"value": value, "ts": time.time()}
+        _cache_data[key] = {"value": value, "ts": time.time(), "ttl": ttl}
         _cache_write_count += 1
         if _cache_write_count % _CACHE_FLUSH_EVERY == 0:
             CACHE_FILE.write_text(json.dumps(_cache_data, indent=2))
@@ -763,8 +767,10 @@ def search_company(
             page_key    = f"page:{hashlib.sha256(company.lower().encode()).hexdigest()}"
             cached_text = _cache_get(page_key)
 
+            _EMPTY_SENTINEL = "__empty__"
+
             if cached_text is not None:
-                raw_text  = cached_text
+                raw_text  = "" if cached_text == _EMPTY_SENTINEL else cached_text
                 http_tier = "HTTP (cached)"
             else:
                 raw_text  = ""
@@ -789,14 +795,17 @@ def search_company(
                         pw_candidate = url  # thin — probably a JS SPA
 
                 # Fall back to Playwright only if all HTTP fetches were too thin
-                if not raw_text and pw_candidate:
+                if not raw_text and pw_candidate and not SKIP_PLAYWRIGHT:
                     pw_text = _playwright_fetch(pw_candidate)
                     if len(pw_text) > MIN_USEFUL_CONTENT_CHARS:
                         raw_text  = pw_text
                         http_tier = "HTTP+JS"
 
+                # Cache result; use short TTL for empty so we retry sooner
                 if raw_text:
                     _cache_set(page_key, raw_text)
+                else:
+                    _cache_set(page_key, _EMPTY_SENTINEL, ttl=CACHE_EMPTY_TTL)
 
             filtered = _filter_job_text(raw_text)
 
