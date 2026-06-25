@@ -493,30 +493,18 @@ def _search_workable(slug: str, job_titles: list[str], location: str) -> list[di
 # Tier 1 parallel runner — all platforms × all slugs simultaneously
 # ---------------------------------------------------------------------------
 
-def _search_platforms_parallel(
-    company: str,
+def _run_platform_phase(
+    slugs: list[str],
+    platforms: list[tuple],
     job_titles: list[str],
     location: str,
 ) -> tuple[list[dict], str]:
-    """
-    Fire every platform+slug combination at once and pick the highest-priority
-    result. Priority: Greenhouse > Lever > Ashby > SmartRecruiters > Workable.
-    Returns (matched_roles, source_label) or ([], "") if not on any platform.
-    """
-    slugs     = _make_slugs(company)
-    platforms = [
-        ("Greenhouse",      _search_greenhouse),
-        ("Lever",           _search_lever),
-        ("Ashby",           _search_ashby),
-        ("SmartRecruiters", _search_smartrecruiters),
-        ("Workable",        _search_workable),
-    ]
+    """Fire all slug×platform combos in parallel; return highest-priority hit or ("", "")."""
     tasks = [
         (prio, slug_i, name, fn, slug)
         for prio, (name, fn) in enumerate(platforms)
         for slug_i, slug in enumerate(slugs)
     ]
-
     hits: dict[tuple, tuple] = {}
     with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
         futures = {
@@ -527,20 +515,45 @@ def _search_platforms_parallel(
             prio, slug_i, name = futures[future]
             try:
                 result = future.result()
-                if result is not None:       # None means "company not on this platform"
+                if result is not None:
                     hits[(prio, slug_i)] = (result, name)
             except Exception:
                 pass
 
-    # Return the highest-priority (lowest prio number, then lowest slug_i) hit
     for prio in range(len(platforms)):
         for slug_i in range(len(slugs)):
             if (prio, slug_i) in hits:
                 roles, name = hits[(prio, slug_i)]
-                source = name if roles else f"{name} — no match"
-                return roles, source
-
+                return roles, name if roles else f"{name} — no match"
     return [], ""
+
+
+def _search_platforms_parallel(
+    company: str,
+    job_titles: list[str],
+    location: str,
+) -> tuple[list[dict], str]:
+    """
+    Two-phase search: fire Greenhouse/Lever/Ashby first; only try
+    SmartRecruiters/Workable if the fast tier found nothing.
+    This keeps latency low for the ~80% of companies already on the fast platforms.
+    """
+    slugs = _make_slugs(company)
+
+    roles, source = _run_platform_phase(
+        slugs,
+        [("Greenhouse", _search_greenhouse), ("Lever", _search_lever), ("Ashby", _search_ashby)],
+        job_titles, location,
+    )
+    if source:
+        return roles, source
+
+    # Fallback phase: SmartRecruiters and Workable
+    return _run_platform_phase(
+        slugs,
+        [("SmartRecruiters", _search_smartrecruiters), ("Workable", _search_workable)],
+        job_titles, location,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,8 +614,8 @@ def _text_likely_relevant(text: str, job_titles: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 def expand_job_title(job_title: str) -> list[str]:
-    # v2 key forces regeneration when prompt changed
-    cache_key = f"synonyms_v2:{hashlib.sha256(job_title.lower().encode()).hexdigest()}"
+    # bump version suffix to force regeneration when prompt changes
+    cache_key = f"synonyms_v3:{hashlib.sha256(job_title.lower().encode()).hexdigest()}"
     cached    = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -610,12 +623,17 @@ def expand_job_title(job_title: str) -> list[str]:
     client = Anthropic()
     prompt = (
         f"List 10-15 job title variants for the EXACT SAME function as: {job_title}\n"
-        f"Include: common abbreviations (e.g. CSM, TAM, AE), seniority variations "
+        f"Include: common abbreviations (e.g. CSM, TAM), seniority variations "
         f"(Senior, Lead, Principal, Director-level), and alternative titles used at "
-        f"SaaS/tech companies for the same role.\n"
-        f"Do NOT include adjacent roles with different responsibilities — "
-        f"for example, do NOT include 'customer support', 'technical support', "
-        f"'help desk', or 'service desk' when the role is customer success or account management.\n"
+        f"SaaS/tech companies for the same post-sale role.\n"
+        f"Critical exclusions — do NOT include these unless they carry a qualifier "
+        f"like 'Expansion' or 'Renewal' that makes them post-sale:\n"
+        f"- 'Account Executive' or 'AE' (pre-sale quota roles) — EXCEPTION: "
+        f"'Expansion Account Executive' or 'Account Executive, Expansion' ARE acceptable\n"
+        f"- 'Sales Manager', 'Sales Representative', 'Business Development'\n"
+        f"- 'Customer Support', 'Technical Support', 'Help Desk', 'Service Desk'\n"
+        f"Only include titles where the PRIMARY responsibility is post-sale: "
+        f"retention, adoption, onboarding, renewals, or expansion.\n"
         f"Return ONLY a JSON array of lowercase strings."
     )
     try:
