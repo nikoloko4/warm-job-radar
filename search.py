@@ -59,27 +59,32 @@ JOB_TEXT_KEYWORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Playwright — single dedicated thread with a task queue
-# Playwright's sync API uses greenlets bound to one thread.
-# All browser calls go through this queue so there's exactly one Chromium process.
+# Playwright — pool of dedicated threads, each with its own Chromium process.
+# Playwright's sync API uses greenlets bound to one thread, so each worker
+# owns its queue exclusively. Requests are round-robined across workers.
+# PW_WORKERS=2 by default — each worker is one Chromium process.
 # ---------------------------------------------------------------------------
 
-_pw_queue   : queue.Queue = queue.Queue()
-_pw_results : dict        = {}
-_pw_lock                  = threading.Lock()
-_pw_thread  : threading.Thread | None = None
+_PW_WORKERS  : int                         = max(1, int(os.getenv("PW_WORKERS", "2")))
+_pw_queues   : list[queue.Queue]           = [queue.Queue() for _ in range(_PW_WORKERS)]
+_pw_results  : dict                        = {}
+_pw_lock                                   = threading.Lock()
+_pw_threads  : list[threading.Thread | None] = [None] * _PW_WORKERS
+_pw_rr_lock                                = threading.Lock()
+_pw_rr_idx   : int                         = 0
 
 
-def _playwright_worker():
+def _playwright_worker(worker_idx: int):
     """Runs in its own thread; restarts Chromium automatically if it crashes."""
+    q = _pw_queues[worker_idx]
     while True:
         try:
             pw      = sync_playwright().start()
             browser = pw.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-            print("[playwright] Browser started")
+            print(f"[playwright:{worker_idx}] Browser started")
             while True:
-                item = _pw_queue.get()
-                if item is None:          # sentinel — shut down
+                item = q.get()
+                if item is None:
                     browser.close()
                     pw.stop()
                     return
@@ -96,7 +101,7 @@ def _playwright_worker():
                             pass
                         text = page.inner_text("body") or ""
                     except Exception as exc:
-                        print(f"[playwright] {url}: {type(exc).__name__}")
+                        print(f"[playwright:{worker_idx}] {url}: {type(exc).__name__}")
                     finally:
                         ctx.close()
                 except Exception:
@@ -105,22 +110,30 @@ def _playwright_worker():
                     _pw_results[req_id] = text
                 event.set()
         except Exception as exc:
-            print(f"[playwright] Worker crashed ({exc}), restarting in 3s…")
+            print(f"[playwright:{worker_idx}] Worker crashed ({exc}), restarting in 3s…")
             time.sleep(3)
 
 
 def _ensure_playwright():
-    global _pw_thread
-    if _pw_thread is None or not _pw_thread.is_alive():
-        _pw_thread = threading.Thread(target=_playwright_worker, daemon=True, name="playwright")
-        _pw_thread.start()
+    for i in range(_PW_WORKERS):
+        if _pw_threads[i] is None or not _pw_threads[i].is_alive():
+            t = threading.Thread(
+                target=_playwright_worker, args=(i,),
+                daemon=True, name=f"playwright-{i}",
+            )
+            t.start()
+            _pw_threads[i] = t
 
 
 def _playwright_fetch(url: str, timeout: float = 20.0) -> str:
+    global _pw_rr_idx
     _ensure_playwright()
+    with _pw_rr_lock:
+        idx = _pw_rr_idx % _PW_WORKERS
+        _pw_rr_idx += 1
     req_id = f"{time.monotonic()}:{url}"
     event  = threading.Event()
-    _pw_queue.put((req_id, url, event))
+    _pw_queues[idx].put((req_id, url, event))
     if not event.wait(timeout=timeout):
         with _pw_lock:
             _pw_results.pop(req_id, None)
@@ -563,7 +576,7 @@ def _search_platforms_parallel(
 def _http_fetch_text(url: str) -> str:
     try:
         resp = _requests.get(
-            url, headers=_HTTP_HEADERS, timeout=6, allow_redirects=True,
+            url, headers=_HTTP_HEADERS, timeout=3, allow_redirects=True,
         )
         if resp.status_code >= 400:
             return ""
