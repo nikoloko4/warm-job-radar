@@ -443,6 +443,7 @@ def update_ui_callback(n_intervals):
         results = list(_state["results"])
         history = list(_state["history"])
 
+    done  = min(done, total)
     pct   = int(done / total * 100) if total > 0 else 0
     label = f"{done} / {total} companies checked" if total > 0 else ""
 

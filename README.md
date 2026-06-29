@@ -6,11 +6,11 @@ Find open job roles at companies where you already have LinkedIn connections —
 
 ## What it does
 
-1. You upload your LinkedIn connections CSV export
-2. You enter a job title (e.g. "Product Manager") and a location (default: United States)
-3. The app probes each company's careers page directly using a browser and extracts open roles
+1. You upload your LinkedIn connections CSV (exported from LinkedIn's full data export)
+2. You enter a job title (e.g. "Customer Success Manager") and a location (default: United States)
+3. The app searches each company's job board using public APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workable) and — when needed — directly scrapes their careers page
 4. Results appear in a table alongside the connection you have at each company
-5. Click any result to get a personalised LinkedIn referral message drafted by Claude, ready to copy and send
+5. Click **Export CSV** to download everything
 
 ---
 
@@ -61,13 +61,20 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Get your key at [console.anthropic.com](https://console.anthropic.com) → API Keys → Create key.
 
-### 5. Export your LinkedIn connections
+### 5. Export your LinkedIn data
 
-1. Go to LinkedIn → **Me** → **Settings & Privacy**
-2. **Data Privacy** → **Get a copy of your data**
-3. Select **Connections** and request the export
-4. LinkedIn will email you a download link within minutes
-5. Unzip and use the `Connections.csv` file
+LinkedIn buries the connections file inside a full data export. Here's how to get it:
+
+1. Go to LinkedIn → **Me** (top right) → **Settings & Privacy**
+2. Click **Data Privacy** in the left sidebar
+3. Click **Get a copy of your data**
+4. Select **"Want something in particular? Select the data files you're most interested in"**
+5. Tick **Connections** and click **Request archive**
+6. LinkedIn will email you a download link — this usually takes a few minutes but can take up to 24 hours
+7. Download and unzip the archive
+8. Inside the zip you'll find a file called **`Connections.csv`** — that's the one to upload
+
+> The zip contains many other files (messages, jobs, etc.) — you only need `Connections.csv`.
 
 ### 6. Run the app
 
@@ -85,70 +92,73 @@ Open [http://127.0.0.1:8050](http://127.0.0.1:8050) in your browser.
 2. Enter the job title you're looking for
 3. Adjust the location filter if needed (defaults to "United States")
 4. Click **Search** — a progress bar shows how many companies have been checked
-5. Results populate in real time as each company is processed
-6. Click any row to generate a personalised referral message for that connection
+5. Results populate in real time
+6. Click any row to see all connections at that company if there are more than three
 7. Click **Export CSV** to download all results
 
 ---
 
 ## How the search works
 
-### Three-tier search strategy
+### Job board APIs first
 
-**Tier 1 — Company's own careers page**
-The app derives likely URL patterns from the company name (e.g. `acme.com/careers`, `careers.acme.com`) and uses a real browser (Playwright/Chromium) to load them. It waits for JavaScript to render, clicks through to job listings, and extracts the full visible text. The first URL that returns real content is used.
+The app checks five public job board APIs in parallel for every company:
 
-**Tier 2 — Fallback platforms**
-If the company's own page yields too little content, the app tries the company's profile on Greenhouse, Lever, and Ashby using the same direct URL pattern approach.
+| Platform | Coverage |
+|----------|----------|
+| Greenhouse | Most common among tech/SaaS companies |
+| Lever | Widely used by startups |
+| Ashby | Popular with newer/smaller startups |
+| SmartRecruiters | Common among mid-size companies |
+| Workable | Common among SMBs and European companies |
 
-**Tier 3 — No results**
-If neither tier finds anything, the row shows "no match" — the app never invents fake results.
+These API calls are fast (under a second each) and return clean structured data.
+
+### Fallback for other companies
+
+If a company isn't on any of those platforms, the app tries fetching their careers page directly via HTTP and — for JavaScript-heavy pages — via a real headless browser (Playwright/Chromium). The page text is passed to Claude Haiku to extract matching roles.
+
+### Synonym expansion
+
+When you type a job title, Claude expands it into 10–15 variants used across the industry (e.g. "Customer Success Manager" → CSM, Client Success Manager, Technical Account Manager, etc.) so you catch roles listed under different names.
 
 ### Location filtering
 
-The location filter is passed to Claude as a constraint: only roles based in, or explicitly open to remote candidates in, the specified location are returned. EU-only or unlocated roles are excluded.
-
-### Cost optimisations built in
-
-- **Page text cache**: Scraped page text is cached for 24 hours. Re-running a search for the same companies costs no extra time.
-- **Claude output cache**: If the same company + job title + page content is seen again, the cached Claude response is reused — no API call.
-- **Pre-filtering**: Navigation menus, cookie banners, footers, and legal text are stripped before sending to Claude. Only job-relevant paragraphs are sent.
-- **Haiku for extraction**: Claude Haiku (cheap) extracts role titles; Claude Sonnet (quality) only runs when you click "Draft referral message".
-- **Local keyword screen**: If the filtered page text contains no words from the job title, Claude is skipped entirely.
-
-### Referral message generator
-
-Clicking a result row sends the connection's name, their title, the company, and the matched role to Claude Sonnet, which drafts a short, specific LinkedIn message. The message references the exact role and connection — not a generic template.
+Roles are filtered to the specified location. Region-specific indicators like EMEA, DACH, London, Tokyo etc. in either the job title or location field are excluded when searching for US roles.
 
 ---
 
 ## Cost expectations
 
+The app uses Claude Haiku for role extraction and synonym expansion — one of the cheapest models available.
+
 | Action | Approximate cost |
 |--------|-----------------|
-| Extracting roles from 50 companies | ~$0.01–0.05 (Haiku) |
-| One referral message draft | ~$0.001 (Sonnet) |
-| Repeat search same day (cached) | $0 |
+| Synonym expansion (once, then cached) | < $0.001 |
+| Searching 100 companies via API | ~$0.00 (no Claude needed) |
+| Extracting roles from 20 companies via page scrape | ~$0.01–0.02 |
+| Repeat search same day (all cached) | $0.00 |
 
-Anthropic charges per token at very low rates. A typical personal-use session costs less than $0.10.
+A typical full run over 500+ companies costs **under $0.05**. Cached re-runs are free.
 
 ---
 
 ## Privacy
 
-- Your `.env` file is excluded from git via `.gitignore` — it will never be committed
-- The app runs entirely locally; data is only sent to the Anthropic API (for role extraction and referral messages) and to the careers pages loaded by Playwright
-- No connection names, email addresses, or personal data are ever logged or stored in files that could be committed
+- Your `.env` file is excluded from git — it will never be committed
+- The app runs entirely locally; data is only sent to the Anthropic API (role extraction and synonym expansion) and to the job board APIs / careers pages being searched
+- No connection names, email addresses, or personal data are logged or stored in any file that could be committed to git
 
 ---
 
 ## Configuration
 
-Optional environment variable in `.env`:
+All settings go in your `.env` file:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_WORKERS` | `3` | Concurrent company searches. Lower = gentler on your machine |
+| `ANTHROPIC_API_KEY` | — | Required. Get one at console.anthropic.com |
+| `MAX_WORKERS` | `5` | How many companies to search in parallel |
 
 ---
 
