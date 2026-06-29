@@ -4,9 +4,26 @@ Find open job roles at companies where you already have LinkedIn connections —
 
 ---
 
+## Before you start — request your LinkedIn data first
+
+**Do this before anything else**, because LinkedIn takes roughly 15 minutes to prepare your file and emails you when it's ready. Start the request, then come back to do the rest of the setup while you wait.
+
+1. Go to [linkedin.com](https://linkedin.com) → click your profile picture (top right) → **Settings & Privacy**
+2. Click **Data privacy** in the left sidebar
+3. Click **Get a copy of your data**
+4. Select **"Download larger data archive, including connections, verifications, contacts, account history…"** — this is the only option that includes your connections
+5. Click **Request archive**
+6. LinkedIn will email you a download link — usually within **~15 minutes**
+7. Download and unzip the archive
+8. Inside the zip, find the file called **`Connections.csv`** — that's the one to upload
+
+> The zip contains many other files. You only need `Connections.csv`.
+
+---
+
 ## What it does
 
-1. You upload your LinkedIn connections CSV (exported from LinkedIn's full data export)
+1. You upload your `Connections.csv`
 2. You enter a job title (e.g. "Customer Success Manager") and a location (default: United States)
 3. The app searches each company's job board using public APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workable) and — when needed — directly scrapes their careers page
 4. Results appear in a table alongside the connection you have at each company
@@ -61,22 +78,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Get your key at [console.anthropic.com](https://console.anthropic.com) → API Keys → Create key.
 
-### 5. Export your LinkedIn data
-
-LinkedIn buries the connections file inside a full data export. Here's how to get it:
-
-1. Go to LinkedIn → **Me** (top right) → **Settings & Privacy**
-2. Click **Data Privacy** in the left sidebar
-3. Click **Get a copy of your data**
-4. Select **"Want something in particular? Select the data files you're most interested in"**
-5. Tick **Connections** and click **Request archive**
-6. LinkedIn will email you a download link — this usually takes a few minutes but can take up to 24 hours
-7. Download and unzip the archive
-8. Inside the zip you'll find a file called **`Connections.csv`** — that's the one to upload
-
-> The zip contains many other files (messages, jobs, etc.) — you only need `Connections.csv`.
-
-### 6. Run the app
+### 5. Run the app
 
 ```bash
 python app.py
@@ -95,6 +97,18 @@ Open [http://127.0.0.1:8050](http://127.0.0.1:8050) in your browser.
 5. Results populate in real time
 6. Click any row to see all connections at that company if there are more than three
 7. Click **Export CSV** to download all results
+
+### How long does the search take?
+
+It depends on how many companies are in your CSV:
+
+| Connections | First run | Repeat runs (cached) |
+|-------------|-----------|----------------------|
+| ~500 companies | 5–10 minutes | Under 2 minutes |
+| ~1000 companies | 10–20 minutes | 2–3 minutes |
+| 1500+ companies | 20–30 minutes | 3–5 minutes |
+
+Results start appearing immediately — you don't need to wait for it to finish. The app caches everything for 24 hours, so running the same search again the next day is nearly instant.
 
 ---
 
