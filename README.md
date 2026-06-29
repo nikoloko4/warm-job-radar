@@ -98,6 +98,18 @@ Open [http://127.0.0.1:8050](http://127.0.0.1:8050) in your browser.
 6. Click any row to see all connections at that company if there are more than three
 7. Click **Export CSV** to download all results
 
+### How long does the search take?
+
+It depends on how many companies are in your CSV:
+
+| Connections | First run | Repeat runs (cached) |
+|-------------|-----------|----------------------|
+| ~500 companies | 5–10 minutes | Under 2 minutes |
+| ~1000 companies | 10–20 minutes | 2–3 minutes |
+| 1500+ companies | 20–30 minutes | 3–5 minutes |
+
+Results start appearing immediately — you don't need to wait for it to finish. The app caches everything for 24 hours, so running the same search again the next day is nearly instant.
+
 ---
 
 ## How the search works
