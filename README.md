@@ -154,7 +154,7 @@ Most companies cost **$0** — if they're on one of those APIs, no Claude call i
 | Each company that needs a page scrape + extraction | ~$0.001–0.0015 |
 | Repeat search same day (all cached) | $0.00 |
 
-**So the total depends on how many of your connections' companies aren't on a supported job board** — that can vary a lot. As a real example: a fresh search (empty cache) over ~1,380 companies cost about **$0.10**. Cached re-runs of the same search cost close to $0.00.
+**So the total depends on how many of your connections' companies aren't on a supported job board** — that can vary a lot. As a real example in my case: a fresh search (empty cache) over ~1,380 companies cost about **$0.10**. Cached re-runs of the same search cost close to $0.00.
 
 
 ---
